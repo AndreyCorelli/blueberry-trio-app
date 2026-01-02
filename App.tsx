@@ -131,6 +131,7 @@ export default function App() {
   const [status, setStatus] = useState<string>("");
   const [statusOk, setStatusOk] = useState<boolean | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
+  const [useDense, setUseDense] = useState(true); // "optimized clues" mode
   const [violations, setViolations] = useState<Violations>({
     row: new Array<boolean>(N).fill(false),
     col: new Array<boolean>(N).fill(false),
@@ -139,6 +140,11 @@ export default function App() {
       new Array<boolean>(N).fill(false),
     ),
   });
+  const [history, setHistory] = useState<PlayerCellState[][][]>([]);
+  const [future, setFuture] = useState<PlayerCellState[][][]>([]);
+
+  const canUndo = history.length > 0;
+  const canRedo = future.length > 0;
 
   function createEmptyPlayerBoard(): PlayerCellState[][] {
     return Array.from({ length: N }, () =>
@@ -154,12 +160,14 @@ export default function App() {
 
     setTimeout(() => {
       console.log("Generating puzzle...");
-      const p = makePuzzle();
+      const p = makePuzzle({ dense: useDense });
       console.log("Puzzle generated");
       setPuzzle(p);
       const empty = createEmptyPlayerBoard();
       setPlayerBoard(empty);
       setViolations(computeViolations(empty, p));
+      setHistory([]);
+      setFuture([]);
       setIsGenerating(false);
     }, 0);
   }
@@ -173,17 +181,74 @@ export default function App() {
     setStatus("");
     setStatusOk(null);
 
-    setPlayerBoard((prev) => {
-      const next = prev.map((row) => row.slice());
-      const current = next[r][c];
+    setPlayerBoard((prevBoard) => {
+      const prevSnapshot = prevBoard.map((row) => row.slice());
+      const nextBoard = prevBoard.map((row) => row.slice());
+
+      const current = nextBoard[r][c];
       let nextVal: PlayerCellState;
       if (current === 0) nextVal = 1;
       else if (current === 1) nextVal = -1;
       else nextVal = 0;
-      next[r][c] = nextVal;
+      nextBoard[r][c] = nextVal;
 
-      setViolations(computeViolations(next, puzzle));
-      return next;
+      setHistory((h) => [...h, prevSnapshot]);
+      setFuture([]);
+      if (puzzle) {
+        setViolations(computeViolations(nextBoard, puzzle));
+      }
+
+      return nextBoard;
+    });
+  }
+
+  function clearBoard() {
+    if (!puzzle) return;
+    const empty = createEmptyPlayerBoard();
+    setPlayerBoard((prevBoard) => {
+      const prevSnapshot = prevBoard.map((row) => row.slice());
+      setHistory((h) => [...h, prevSnapshot]);
+      setFuture([]);
+      setViolations(computeViolations(empty, puzzle));
+      setStatus("");
+      setStatusOk(null);
+      return empty;
+    });
+  }
+
+  function undo() {
+    if (!puzzle) return;
+    setHistory((prevHist) => {
+      if (prevHist.length === 0) return prevHist;
+      const newHist = [...prevHist];
+      const lastBoard = newHist.pop()!;
+      setPlayerBoard((currentBoard) => {
+        const currentSnapshot = currentBoard.map((row) => row.slice());
+        setFuture((f) => [...f, currentSnapshot]);
+        setViolations(computeViolations(lastBoard, puzzle));
+        return lastBoard;
+      });
+      setStatus("");
+      setStatusOk(null);
+      return newHist;
+    });
+  }
+
+  function redo() {
+    if (!puzzle) return;
+    setFuture((prevFuture) => {
+      if (prevFuture.length === 0) return prevFuture;
+      const newFuture = [...prevFuture];
+      const nextBoard = newFuture.pop()!;
+      setPlayerBoard((currentBoard) => {
+        const currentSnapshot = currentBoard.map((row) => row.slice());
+        setHistory((h) => [...h, currentSnapshot]);
+        setViolations(computeViolations(nextBoard, puzzle));
+        return nextBoard;
+      });
+      setStatus("");
+      setStatusOk(null);
+      return newFuture;
     });
   }
 
@@ -221,6 +286,10 @@ export default function App() {
     setShowSolution((prev) => !prev);
     setStatus("");
     setStatusOk(null);
+  }
+
+  function toggleDense() {
+    setUseDense((prev) => !prev);
   }
 
   function getCellBorderStyle(r: number, c: number) {
@@ -325,14 +394,8 @@ export default function App() {
               ))}
             </View>
 
+            {/* Row: Check */}
             <View style={styles.buttonsRow}>
-              <Pressable
-                style={styles.button}
-                onPress={generateNewPuzzle}
-                disabled={isGenerating}
-              >
-                <Text style={styles.buttonText}>New puzzle</Text>
-              </Pressable>
               <Pressable
                 style={styles.button}
                 onPress={checkSolution}
@@ -342,6 +405,38 @@ export default function App() {
               </Pressable>
             </View>
 
+            {/* Row: Undo / Redo / Clear */}
+            <View style={styles.buttonsRow}>
+              <Pressable
+                style={[
+                  styles.button,
+                  (!canUndo || isGenerating) && styles.buttonDisabled,
+                ]}
+                onPress={undo}
+                disabled={!canUndo || isGenerating}
+              >
+                <Text style={styles.buttonText}>Undo</Text>
+              </Pressable>
+              <Pressable
+                style={[
+                  styles.button,
+                  (!canRedo || isGenerating) && styles.buttonDisabled,
+                ]}
+                onPress={redo}
+                disabled={!canRedo || isGenerating}
+              >
+                <Text style={styles.buttonText}>Redo</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.button, isGenerating && styles.buttonDisabled]}
+                onPress={clearBoard}
+                disabled={isGenerating}
+              >
+                <Text style={styles.buttonText}>Clear</Text>
+              </Pressable>
+            </View>
+
+            {/* Show / Hide solution */}
             <Pressable
               style={styles.toggle}
               onPress={toggleShowSolution}
@@ -354,6 +449,18 @@ export default function App() {
           </>
         )}
 
+        {/* Optimized / dense clues toggle */}
+        <Pressable
+          style={styles.toggleSmall}
+          onPress={toggleDense}
+          disabled={isGenerating}
+        >
+          <Text style={styles.toggleTextSmall}>
+            Optimized clues: {useDense ? "ON" : "OFF"}
+          </Text>
+        </Pressable>
+
+        {/* Big generate button */}
         <Pressable
           style={[styles.buttonWide, isGenerating && styles.buttonDisabled]}
           onPress={generateNewPuzzle}
@@ -393,7 +500,7 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     alignItems: "center",
-    paddingTop: 16,
+    paddingTop: 40, // moved down out of notch/camera area
   },
   title: {
     fontSize: 24,
@@ -449,11 +556,11 @@ const styles = StyleSheet.create({
     borderWidth: 2,
   },
   cellClueAreaViolation: {
-    backgroundColor: "#fef3c7", // light amber for clue-related issues
+    backgroundColor: "#fef3c7", // light amber
   },
   buttonsRow: {
     flexDirection: "row",
-    marginBottom: 12,
+    marginBottom: 8,
     gap: 8,
   },
   button: {
@@ -471,18 +578,28 @@ const styles = StyleSheet.create({
     marginTop: 4,
   },
   buttonDisabled: {
-    opacity: 0.6,
+    opacity: 0.4,
   },
   buttonText: {
     color: "#fff",
     fontWeight: "600",
   },
   toggle: {
-    marginBottom: 8,
+    marginBottom: 4,
   },
   toggleText: {
     color: "#2563eb",
     textDecorationLine: "underline",
+  },
+  toggleSmall: {
+    marginTop: 4,
+    marginBottom: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+  },
+  toggleTextSmall: {
+    fontSize: 12,
+    color: "#374151",
   },
   status: {
     marginTop: 6,

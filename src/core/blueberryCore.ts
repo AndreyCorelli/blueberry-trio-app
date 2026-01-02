@@ -354,7 +354,7 @@ export function solveCount(clues: Map<string, number>, maxSolutions = 2): number
   return solutions;
 }
 
-// ---------- Puzzle generator with clue minimization ----------
+// ---------- Puzzle generator with clue minimization + density ----------
 
 function cellsToMap(cells: CellClue[]): Map<string, number> {
   const m = new Map<string, number>();
@@ -364,7 +364,15 @@ function cellsToMap(cells: CellClue[]): Map<string, number> {
   return m;
 }
 
-export function makePuzzle(): Puzzle {
+function cellKey(cell: CellClue): string {
+  return `${cell.r},${cell.c}`;
+}
+
+const MIN_DENSE_CLUES = 22; // heuristic; adjust if you like
+
+export function makePuzzle(options?: { dense?: boolean }): Puzzle {
+  const dense = options?.dense ?? false;
+
   const board = generateBoard();
   checkConstraints(board);
   const cluesFull = computeClues(board);
@@ -380,19 +388,61 @@ export function makePuzzle(): Puzzle {
 
   let active: CellClue[] = clueCells.slice();
   const baseMap = cellsToMap(active);
-  solveCount(baseMap, 2); // just to warm up / sanity-check
+  solveCount(baseMap, 2); // warmup / sanity
 
   const order = clueCells.slice();
   shuffle(order);
 
+  // Minimalise: remove clues while uniqueness stays == 1
   for (const cell of order) {
     const { r, c } = cell;
     const trial = active.filter((cl) => !(cl.r === r && cl.c === c));
     const trialMap = cellsToMap(trial);
     const sols = solveCount(trialMap, 2);
     if (sols === 1) {
-      active = trial; // still unique, so we can drop this clue
+      active = trial; // still unique, so remove
     }
+  }
+
+  // --- Reasonable clue density heuristic (optional) ---
+  if (dense) {
+    const activeSet = new Set(active.map(cellKey));
+    let removed = clueCells.filter((cl) => !activeSet.has(cellKey(cl)));
+
+    // Ensure each 3x3 block has at least one clue
+    for (let br = 0; br < 3; br++) {
+      for (let bc = 0; bc < 3; bc++) {
+        const hasActiveInBlock = active.some(
+          (cl) =>
+            Math.floor(cl.r / 3) === br && Math.floor(cl.c / 3) === bc,
+        );
+        if (!hasActiveInBlock) {
+          const idx = removed.findIndex(
+            (cl) =>
+              Math.floor(cl.r / 3) === br && Math.floor(cl.c / 3) === bc,
+          );
+          if (idx !== -1) {
+            const picked = removed[idx];
+            active.push(picked);
+            activeSet.add(cellKey(picked));
+            removed.splice(idx, 1);
+          }
+        }
+      }
+    }
+
+    // Ensure at least MIN_DENSE_CLUES clues total
+    if (active.length < MIN_DENSE_CLUES) {
+      shuffle(removed);
+      while (active.length < MIN_DENSE_CLUES && removed.length > 0) {
+        const picked = removed.pop()!;
+        if (!activeSet.has(cellKey(picked))) {
+          active.push(picked);
+          activeSet.add(cellKey(picked));
+        }
+      }
+    }
+    // Adding clues never breaks uniqueness (only makes puzzle easier).
   }
 
   const puzzleClues: ClueGrid = Array.from({ length: N }, () =>
