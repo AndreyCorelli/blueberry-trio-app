@@ -16,6 +16,8 @@ import {
 import { makePuzzle, N } from "./src/core/blueberryCore";
 import type { Puzzle } from "./src/core/blueberryCore";
 import { computeClueAreaViolations } from "./src/core/clueCheck";
+import { loadSavedGame, scheduleSave, clearSavedGame } from "./src/core/gameSave";
+
 
 type PlayerCellState = -1 | 0 | 1; // -1 = marked empty, 0 = unknown, 1 = berry
 
@@ -111,6 +113,8 @@ export default function App() {
   const readyToCheck =
   !!puzzle && !showSolution && totalBerries === TOTAL_BERRIES_REQUIRED;
   const checkPulse = React.useRef(new Animated.Value(1)).current;
+  const [isHydrating, setIsHydrating] = useState(true);
+  const didHydrateRef = React.useRef(false);
 
   function createEmptyPlayerBoard(): PlayerCellState[][] {
     return Array.from({ length: N }, () =>
@@ -364,6 +368,54 @@ export default function App() {
     };
   }, [readyToCheck, checkPulse]);
 
+  useEffect(() => {
+    let alive = true;
+  
+    (async () => {
+      try {
+        const saved = await loadSavedGame(N);
+        if (!alive) return;
+  
+        if (saved) {
+          setPuzzle(saved.puzzle);
+          setPlayerBoard(saved.playerBoard);
+          setHistory(saved.history);
+          setFuture(saved.future);
+          setUseDense(saved.useDense);
+          setShowSolution(false);
+          setStatus("");
+          setStatusOk(null);
+  
+          setViolations(computeViolations(saved.playerBoard, saved.puzzle));
+        }
+      } finally {
+        if (!alive) return;
+        didHydrateRef.current = true;
+        setIsHydrating(false);
+      }
+    })();
+  
+    return () => {
+      alive = false;
+    };
+  }, []);
+  
+  useEffect(() => {
+    if (!didHydrateRef.current) return;
+    if (!puzzle) return;
+  
+    scheduleSave({
+      v: 1,
+      savedAt: Date.now(),
+      puzzle,
+      playerBoard,
+      history,
+      future,
+      useDense,
+    });
+  }, [puzzle, playerBoard, history, future, useDense]);
+  
+
   return (
     <SafeAreaView style={styles.safe}>
       <StatusBar barStyle="dark-content" />
@@ -371,7 +423,7 @@ export default function App() {
         <Text style={styles.title}>Blueberry Puzzle</Text>
         <Text style={styles.subtitle}>3 berries per row, column & block</Text>
 
-        {!puzzle && !isGenerating && (
+        {!puzzle && !isGenerating && !isHydrating && (
           <Text style={styles.hint}>
             Press <Text style={styles.bold}>Generate puzzle</Text> to start.
           </Text>
@@ -381,6 +433,13 @@ export default function App() {
           <View style={styles.generating}>
             <ActivityIndicator size="small" />
             <Text style={styles.generatingText}>Generating puzzle…</Text>
+          </View>
+        )}
+
+        {isHydrating && (
+          <View style={styles.generating}>
+            <ActivityIndicator size="small" />
+            <Text style={styles.generatingText}>Loading saved game…</Text>
           </View>
         )}
 
@@ -400,7 +459,7 @@ export default function App() {
                 <Pressable
                   style={[styles.button, readyToCheck && styles.buttonCheckReady]}
                   onPress={checkSolution}
-                  disabled={isGenerating}
+                  disabled={isGenerating || isHydrating}
                 >
                   <Text style={styles.buttonText}>Check</Text>
                 </Pressable>
@@ -432,7 +491,7 @@ export default function App() {
               <Pressable
                 style={[styles.button, isGenerating && styles.buttonDisabled]}
                 onPress={clearBoard}
-                disabled={isGenerating}
+                disabled={isGenerating || isHydrating}
               >
                 <Text style={styles.buttonText}>Clear</Text>
               </Pressable>
@@ -442,7 +501,7 @@ export default function App() {
             <Pressable
               style={styles.toggle}
               onPress={toggleShowSolution}
-              disabled={isGenerating}
+              disabled={isGenerating || isHydrating}
             >
               <Text style={styles.toggleText}>
                 {showSolution ? "Hide solution" : "Show solution"}
@@ -462,7 +521,7 @@ export default function App() {
                 !useDense && styles.difficultyPillActive,
               ]}
               onPress={() => setUseDense(false)}
-              disabled={isGenerating}
+              disabled={isGenerating || isHydrating}
             >
               <Text
                 style={[
@@ -480,7 +539,7 @@ export default function App() {
                 useDense && styles.difficultyPillActive,
               ]}
               onPress={() => setUseDense(true)}
-              disabled={isGenerating}
+              disabled={isGenerating || isHydrating}
             >
               <Text
                 style={[
@@ -499,7 +558,7 @@ export default function App() {
         <Pressable
           style={[styles.buttonWide, isGenerating && styles.buttonDisabled]}
           onPress={generateNewPuzzle}
-          disabled={isGenerating}
+          disabled={isGenerating || isHydrating}
         >
           <Text style={styles.buttonText}>
             {puzzle ? "Generate another puzzle" : "Generate puzzle"}
