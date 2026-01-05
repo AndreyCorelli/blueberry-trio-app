@@ -3,6 +3,8 @@ import type { Puzzle } from "../core/blueberryCore";
 
 export type PlayerCellState = -1 | 0 | 1;
 
+export type PuzzleSource = "generated" | "pool";
+
 export type SavedGameV1 = {
   v: 1;
   savedAt: number;
@@ -17,6 +19,8 @@ export type SavedGameV1 = {
 
   // optional: remember what "next puzzle difficulty" was set to
   useDense: boolean;
+  puzzleSource?: PuzzleSource;
+  poolIndex?: number | null; // 0-based index in pool
 };
 
 // ---------- Pool types ----------
@@ -97,6 +101,15 @@ function validateSavedGameV1(x: unknown, N: number): x is SavedGameV1 {
   if (!p || typeof p !== "object") return false;
   if (!is2D<number>(p.solution, N, N)) return false;
   if (!is2D<number | null>(p.puzzleClues, N, N)) return false;
+  if (o.puzzleSource !== undefined && o.puzzleSource !== "generated" && o.puzzleSource !== "pool") {
+    return false;
+  }
+  if (o.poolIndex !== undefined && o.poolIndex !== null && typeof o.poolIndex !== "number") {
+    return false;
+  }
+  if (typeof o.poolIndex === "number" && (!Number.isInteger(o.poolIndex) || o.poolIndex < 0)) {
+    return false;
+  }
 
   // player board
   if (!is2D<unknown>(o.playerBoard, N, N)) return false;

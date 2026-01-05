@@ -25,6 +25,7 @@ import {
   markPoolIndexLoaded,
   markPoolIndexSolved,
   resetPoolProgress,
+  loadSavedGame,
 } from "./src/core/gameSave";
 
 import type { PuzzlePoolV1 } from "./src/core/gameSave";
@@ -207,6 +208,10 @@ export default function App() {
   const poolRemaining = pool ? Math.max(0, poolSize - poolProgressLoadedCount) : 0;
   const poolHasRemaining = poolAvailable && poolRemaining > 0; 
   const [isSolved, setIsSolved] = useState(false); 
+  const titleText =
+  puzzleSource === "pool" && currentPoolIndex !== null
+    ? `Blueberry Puzzle ${currentPoolIndex + 1}`
+    : "Blueberry Puzzle";
 
 
   function resetGameState() {
@@ -248,6 +253,7 @@ export default function App() {
 
     setTimeout(() => {
       const p = makePuzzle({ dense });
+      setCurrentPoolIndex(null);
       startGameWithPuzzle(p, "generated");
       setIsGenerating(false);
     }, 0);
@@ -592,8 +598,9 @@ export default function App() {
 
   // Autosave current game state (only while on game screen and puzzle exists)
   useEffect(() => {
+    if (screen !== "game") return;
     if (!puzzle) return;
-
+  
     scheduleSave({
       v: 1,
       savedAt: Date.now(),
@@ -601,9 +608,13 @@ export default function App() {
       playerBoard,
       history,
       future,
-      useDense: false, // no longer in UI; keep field for compatibility
+      useDense: false, // keep for compatibility
+  
+      // NEW meta
+      puzzleSource,
+      poolIndex: puzzleSource === "pool" ? currentPoolIndex : null,
     });
-  }, [puzzle, playerBoard, history, future]);
+  }, [screen, puzzle, playerBoard, history, future, puzzleSource, currentPoolIndex]);
 
   // Load + validate pool once
   useEffect(() => {
@@ -627,8 +638,42 @@ export default function App() {
       setPoolProgressLoadedCount(progress.loaded.length);
     })();
   }, [pool]);
-  
 
+  useEffect(() => {
+    let alive = true;
+  
+    (async () => {
+      try {
+        const saved = await loadSavedGame(N);
+        if (!alive) return;
+        if (!saved) return;
+  
+        setPuzzle(saved.puzzle);
+        setPlayerBoard(saved.playerBoard);
+        setHistory(saved.history);
+        setFuture(saved.future);
+        setShowSolution(false);
+        setStatus("");
+        setStatusOk(null);
+  
+        // restore meta (safe defaults)
+        const src = saved.puzzleSource ?? "generated";
+        setPuzzleSource(src);
+        setCurrentPoolIndex(src === "pool" ? (saved.poolIndex ?? null) : null);
+  
+        setViolations(computeViolations(saved.playerBoard, saved.puzzle));
+        setScreen("game"); // <-- this is the key thing you lost
+      } catch {
+        // ignore corrupted saves
+      }
+    })();
+  
+    return () => {
+      alive = false;
+    };
+  }, []);
+  
+  
   const startDisabled = isGenerating;
   const poolDisabled = !poolHasRemaining || startDisabled;
 
@@ -637,7 +682,7 @@ export default function App() {
       <StatusBar barStyle="dark-content" />
 
       <View style={styles.container}>
-        <Text style={styles.title}>Blueberry Puzzle</Text>
+        <Text style={styles.title}>{titleText}</Text>
         <Text style={styles.subtitle}>3 berries per row, column & block</Text>
 
         {isGenerating && (
