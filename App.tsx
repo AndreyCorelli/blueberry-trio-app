@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   SafeAreaView,
   View,
@@ -13,11 +13,21 @@ import {
   TextStyle,
   ViewStyle,
 } from "react-native";
-import { makePuzzle, N } from "./src/core/blueberryCore";
+import { makePuzzle, N, solveOneFromClueGrid } from "./src/core/blueberryCore";
 import type { Puzzle } from "./src/core/blueberryCore";
 import { computeClueAreaViolations } from "./src/core/clueCheck";
-import { loadSavedGame, scheduleSave, clearSavedGame } from "./src/core/gameSave";
+import {
+  scheduleSave,
+  clearSavedGame,
+  loadPoolProgress,
+  getNextNotLoadedIndex,
+  getRandomNotLoadedIndex,
+  markPoolIndexLoaded,
+  markPoolIndexSolved,
+  resetPoolProgress,
+} from "./src/core/gameSave";
 
+import type { PuzzlePoolV1 } from "./src/core/gameSave";
 
 type PlayerCellState = -1 | 0 | 1; // -1 = marked empty, 0 = unknown, 1 = berry
 
@@ -28,11 +38,14 @@ type Violations = {
   clueArea: boolean[][];
 };
 
+// Pool JSON is bundled into the app
+const RAW_POOL_JSON = require("./assets/pool/puzzlePool.v1.json");
+
 function computeViolations(board: PlayerCellState[][], puzzle: Puzzle): Violations {
   const row = new Array<boolean>(N).fill(false);
   const col = new Array<boolean>(N).fill(false);
   const block = new Array<boolean>(N).fill(false);
-  const { clueArea } = computeClueAreaViolations(board, puzzle.puzzleClues);  
+  const { clueArea } = computeClueAreaViolations(board, puzzle.puzzleClues);
 
   // --- Row violations ---
   for (let r = 0; r < N; r++) {
@@ -84,62 +97,255 @@ function computeViolations(board: PlayerCellState[][], puzzle: Puzzle): Violatio
   return { row, col, block, clueArea };
 }
 
+function isInt(x: unknown): x is number {
+  return typeof x === "number" && Number.isInteger(x);
+}
+
+function validatePoolOrThrow(x: unknown): PuzzlePoolV1 {
+  if (!x || typeof x !== "object") throw new Error("Pool JSON is not an object");
+  const o = x as any;
+
+  if (o.version !== 1) throw new Error(`Unsupported pool version: ${String(o.version)}`);
+  if (!isInt(o.N) || o.N !== N) throw new Error(`Pool N mismatch: file=${String(o.N)} code=${N}`);
+  if (typeof o.generatedAtUtc !== "string") throw new Error("Pool generatedAtUtc missing/invalid");
+
+  if (!Array.isArray(o.puzzles)) throw new Error("Pool puzzles must be an array");
+  if (o.puzzles.length === 0) throw new Error("Pool puzzles is empty");
+
+  for (let i = 0; i < o.puzzles.length; i++) {
+    const p = o.puzzles[i];
+    if (!p || typeof p !== "object") throw new Error(`Puzzle[${i}] is not an object`);
+    if (typeof p.genSeconds !== "number" || !Number.isFinite(p.genSeconds) || p.genSeconds < 0) {
+      throw new Error(`Puzzle[${i}].genSeconds invalid`);
+    }
+    if (typeof p.humanComplex !== "number" || !Number.isFinite(p.humanComplex)) {
+      throw new Error(`Puzzle[${i}].humanComplex invalid`);
+    }
+    if (!Array.isArray(p.clues81) || p.clues81.length !== N * N) {
+      throw new Error(`Puzzle[${i}].clues81 must be length ${N * N}`);
+    }
+    for (const v of p.clues81) {
+      if (!isInt(v) || (v !== -1 && (v < 0 || v > 8))) {
+        throw new Error(`Puzzle[${i}].clues81 contains invalid value: ${String(v)}`);
+      }
+    }
+  }
+
+  return o as PuzzlePoolV1;
+}
+
+
+function decodeClues81ToGrid(clues81: number[]): (number | null)[][] {
+  if (clues81.length !== N * N) {
+    throw new Error(`clues81 length mismatch: got ${clues81.length}, expected ${N * N}`);
+  }
+  const grid: (number | null)[][] = Array.from({ length: N }, () =>
+    new Array<number | null>(N).fill(null),
+  );
+  let k = 0;
+  for (let r = 0; r < N; r++) {
+    for (let c = 0; c < N; c++) {
+      const v = clues81[k++];
+      grid[r][c] = v === -1 ? null : v;
+    }
+  }
+  return grid;
+}
+
+function createEmptyPlayerBoard(): PlayerCellState[][] {
+  return Array.from({ length: N }, () => new Array<PlayerCellState>(N).fill(0));
+}
+
+const CELL_SIZE = 32;
+const TOTAL_BERRIES_REQUIRED = 27;
+
+type Screen = "start" | "game";
+type PuzzleSource = "generated" | "pool";
+
 export default function App() {
+  const [screen, setScreen] = useState<Screen>("start");
+
   const [puzzle, setPuzzle] = useState<Puzzle | null>(null);
+  const [puzzleSource, setPuzzleSource] = useState<PuzzleSource>("generated");
+
   const [playerBoard, setPlayerBoard] = useState<PlayerCellState[][]>([]);
   const [showSolution, setShowSolution] = useState(false);
   const [status, setStatus] = useState<string>("");
   const [statusOk, setStatusOk] = useState<boolean | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
-  const [useDense, setUseDense] = useState(false); // "optimized clues" mode
+
   const [violations, setViolations] = useState<Violations>({
     row: new Array<boolean>(N).fill(false),
     col: new Array<boolean>(N).fill(false),
     block: new Array<boolean>(N).fill(false),
-    clueArea: Array.from({ length: N }, () =>
-      new Array<boolean>(N).fill(false),
-    ),
+    clueArea: Array.from({ length: N }, () => new Array<boolean>(N).fill(false)),
   });
+
   const [history, setHistory] = useState<PlayerCellState[][][]>([]);
   const [future, setFuture] = useState<PlayerCellState[][][]>([]);
 
   const canUndo = history.length > 0;
   const canRedo = future.length > 0;
+
   const totalBerries = playerBoard.reduce(
     (acc, row) => acc + row.filter((v) => v === 1).length,
     0,
   );
-  
-  const readyToCheck =
-  !!puzzle && !showSolution && totalBerries === TOTAL_BERRIES_REQUIRED;
-  const checkPulse = React.useRef(new Animated.Value(1)).current;
-  const [isHydrating, setIsHydrating] = useState(true);
-  const didHydrateRef = React.useRef(false);
 
-  function createEmptyPlayerBoard(): PlayerCellState[][] {
-    return Array.from({ length: N }, () =>
-      new Array<PlayerCellState>(N).fill(0),
-    );
+  const readyToCheck = !!puzzle && !showSolution && totalBerries === TOTAL_BERRIES_REQUIRED;
+
+  const checkPulse = useRef(new Animated.Value(1)).current;
+
+  const [pool, setPool] = useState<PuzzlePoolV1 | null>(null);
+  const [poolError, setPoolError] = useState<string | null>(null);
+
+  const poolSize = pool?.puzzles.length ?? 0;  
+
+  const poolAvailable = useMemo(() => !!pool && poolSize > 0, [pool, poolSize]);
+  const [currentPoolIndex, setCurrentPoolIndex] = useState<number | null>(null);
+  const [poolProgressLoadedCount, setPoolProgressLoadedCount] = useState<number>(0);
+  const poolRemaining = pool ? Math.max(0, poolSize - poolProgressLoadedCount) : 0;
+  const poolHasRemaining = poolAvailable && poolRemaining > 0; 
+  const [isSolved, setIsSolved] = useState(false); 
+
+
+  function resetGameState() {
+    setPuzzle(null);
+    setPlayerBoard([]);
+    setShowSolution(false);
+    setStatus("");
+    setStatusOk(null);
+    setHistory([]);
+    setFuture([]);
+    setViolations({
+      row: new Array<boolean>(N).fill(false),
+      col: new Array<boolean>(N).fill(false),
+      block: new Array<boolean>(N).fill(false),
+      clueArea: Array.from({ length: N }, () => new Array<boolean>(N).fill(false)),
+    });
   }
 
-  function generateNewPuzzle() {
+  function startGameWithPuzzle(p: Puzzle, source: PuzzleSource) {
+    const empty = createEmptyPlayerBoard();
+    setPuzzle(p);
+    setPuzzleSource(source);
+    setPlayerBoard(empty);
+    setViolations(computeViolations(empty, p));
+    setHistory([]);
+    setFuture([]);
+    setShowSolution(false);
+    setIsSolved(false);
+    setStatus("");
+    setStatusOk(null);
+    setScreen("game");
+  }
+
+  function generatePuzzle(dense: boolean) {
     setIsGenerating(true);
     setStatus("");
     setStatusOk(null);
     setShowSolution(false);
 
     setTimeout(() => {
-      console.log("Generating puzzle...");
-      const p = makePuzzle({ dense: useDense });
-      console.log("Puzzle generated");
-      setPuzzle(p);
-      const empty = createEmptyPlayerBoard();
-      setPlayerBoard(empty);
-      setViolations(computeViolations(empty, p));
-      setHistory([]);
-      setFuture([]);
+      const p = makePuzzle({ dense });
+      startGameWithPuzzle(p, "generated");
       setIsGenerating(false);
     }, 0);
+  }
+
+  async function loadNextPuzzleFromPool() {
+    if (!poolAvailable) return;
+    setIsGenerating(true);
+    setStatus("");
+    setStatusOk(null);
+  
+    try {
+      const progress = await loadPoolProgress(pool!);
+      const idx = getNextNotLoadedIndex(pool!, progress);
+  
+      if (idx === null) {
+        setStatus("Pool exhausted. No new puzzles left.");
+        setStatusOk(null);
+        return;
+      }
+  
+      const entry = pool!.puzzles[idx];
+      const puzzleClues = decodeClues81ToGrid(entry.clues81);
+  
+      const solution = solveOneFromClueGrid(puzzleClues);
+      if (!solution) {
+        setStatus(`Pool puzzle #${idx} could not be solved. Skipping.`);
+        setStatusOk(false);
+        // mark it loaded so you don't get stuck hitting it repeatedly
+        await markPoolIndexLoaded(pool!, idx);
+        return;
+      }
+  
+      const p: Puzzle = { puzzleClues, solution };
+      startGameWithPuzzle(p, "pool");
+      setCurrentPoolIndex(idx);
+  
+      const updated = await markPoolIndexLoaded(pool!, idx);
+      setPoolProgressLoadedCount(updated.loaded.length);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setStatus(`Failed to load next pool puzzle: ${msg}`);
+      setStatusOk(false);
+    } finally {
+      setIsGenerating(false);
+    }
+  }
+  
+
+  async function loadRandomPuzzleFromPool() {
+    if (!poolAvailable) return;
+    setIsGenerating(true);
+    setStatus("");
+    setStatusOk(null);
+  
+    try {
+      const progress = await loadPoolProgress(pool!);
+      const idx = getRandomNotLoadedIndex(pool!, progress);
+  
+      if (idx === null) {
+        setStatus("Pool exhausted. No new puzzles left.");
+        setStatusOk(null);
+        return;
+      }
+  
+      const entry = pool!.puzzles[idx];
+      const puzzleClues = decodeClues81ToGrid(entry.clues81);
+  
+      const solution = solveOneFromClueGrid(puzzleClues);
+      if (!solution) {
+        setStatus(`Pool puzzle #${idx} could not be solved. Skipping.`);
+        setStatusOk(false);
+        await markPoolIndexLoaded(pool!, idx);
+        return;
+      }
+  
+      const p: Puzzle = { puzzleClues, solution };
+      startGameWithPuzzle(p, "pool");
+      setCurrentPoolIndex(idx);
+  
+      const updated = await markPoolIndexLoaded(pool!, idx);
+      setPoolProgressLoadedCount(updated.loaded.length);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setStatus(`Failed to load random pool puzzle: ${msg}`);
+      setStatusOk(false);
+    } finally {
+      setIsGenerating(false);
+    }
+  }
+  
+
+  function newGame() {
+    setCurrentPoolIndex(null);
+    resetGameState();
+    setIsSolved(false);
+    void clearSavedGame();
+    setScreen("start");
   }
 
   function handleCellPress(r: number, c: number) {
@@ -164,9 +370,7 @@ export default function App() {
 
       setHistory((h) => [...h, prevSnapshot]);
       setFuture([]);
-      if (puzzle) {
-        setViolations(computeViolations(nextBoard, puzzle));
-      }
+      setViolations(computeViolations(nextBoard, puzzle));
 
       return nextBoard;
     });
@@ -244,6 +448,10 @@ export default function App() {
     setViolations(computeViolations(playerBoard, puzzle));
 
     if (allMatch) {
+      if (puzzleSource === "pool" && currentPoolIndex !== null && pool) {
+        void markPoolIndexSolved(pool, currentPoolIndex);
+      }
+      setIsSolved(true);
       setStatus("✅ Correct! Puzzle solved.");
       setStatusOk(true);
     } else {
@@ -261,10 +469,8 @@ export default function App() {
   function getCellBorderStyle(r: number, c: number) {
     const top = r === 0 ? 2 : r % 3 === 0 ? 2 : 1;
     const left = c === 0 ? 2 : c % 3 === 0 ? 2 : 1;
-    const right =
-      c === N - 1 ? 2 : (c + 1) % 3 === 0 ? 2 : 1;
-    const bottom =
-      r === N - 1 ? 2 : (r + 1) % 3 === 0 ? 2 : 1;
+    const right = c === N - 1 ? 2 : (c + 1) % 3 === 0 ? 2 : 1;
+    const bottom = r === N - 1 ? 2 : (r + 1) % 3 === 0 ? 2 : 1;
 
     return {
       borderTopWidth: top,
@@ -276,25 +482,20 @@ export default function App() {
 
   function renderCell(r: number, c: number) {
     if (!puzzle) return null;
-  
+
     const clue = puzzle.puzzleClues[r][c];
     const solutionBerry = puzzle.solution[r][c] === 1;
     const state = playerBoard[r]?.[c] ?? 0;
-  
+
     const blockIndex = Math.floor(r / 3) * 3 + Math.floor(c / 3);
-    const isUnitViolated =
-      violations.row[r] || violations.col[c] || violations.block[blockIndex];
+    const isUnitViolated = violations.row[r] || violations.col[c] || violations.block[blockIndex];
     const isClueAreaViolated = violations.clueArea[r]?.[c] ?? false;
-  
+
     let text = "";
-  
-    const cellStyles: StyleProp<ViewStyle>[] = [
-      styles.cell,
-      getCellBorderStyle(r, c),
-    ];
-  
+
+    const cellStyles: StyleProp<ViewStyle>[] = [styles.cell, getCellBorderStyle(r, c)];
     const textStyles: StyleProp<TextStyle>[] = [styles.cellText];
-  
+
     if (showSolution) {
       if (solutionBerry) {
         text = "●";
@@ -314,7 +515,7 @@ export default function App() {
         text = "×";
         textStyles.push(styles.cellPlayerEmpty);
       }
-  
+
       if (isUnitViolated) {
         cellStyles.push(styles.cellViolation);
       }
@@ -322,7 +523,7 @@ export default function App() {
         cellStyles.push(styles.cellClueAreaViolation);
       }
     }
-  
+
     return (
       <Pressable
         key={`${r}-${c}`}
@@ -333,14 +534,35 @@ export default function App() {
       </Pressable>
     );
   }
+
+  async function handleResetPoolProgress() {
+    if (!pool) return;
+    setStatus("");
+    setStatusOk(null);
   
+    try {
+      await resetPoolProgress(pool);
+  
+      // Update UI immediately
+      setPoolProgressLoadedCount(0);
+  
+      setStatus("Pool progress reset.");
+      setStatusOk(true);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setStatus(`Failed to reset pool progress: ${msg}`);
+      setStatusOk(false);
+    }
+  }
+
+  // Pulse animation for Check button
   useEffect(() => {
     if (!readyToCheck) {
       checkPulse.stopAnimation();
       checkPulse.setValue(1);
       return;
     }
-  
+
     const anim = Animated.loop(
       Animated.sequence([
         Animated.timing(checkPulse, {
@@ -358,9 +580,9 @@ export default function App() {
         Animated.delay(200),
       ]),
     );
-  
+
     anim.start();
-  
+
     return () => {
       anim.stop();
       checkPulse.stopAnimation();
@@ -368,42 +590,10 @@ export default function App() {
     };
   }, [readyToCheck, checkPulse]);
 
+  // Autosave current game state (only while on game screen and puzzle exists)
   useEffect(() => {
-    let alive = true;
-  
-    (async () => {
-      try {
-        const saved = await loadSavedGame(N);
-        if (!alive) return;
-  
-        if (saved) {
-          setPuzzle(saved.puzzle);
-          setPlayerBoard(saved.playerBoard);
-          setHistory(saved.history);
-          setFuture(saved.future);
-          setUseDense(saved.useDense);
-          setShowSolution(false);
-          setStatus("");
-          setStatusOk(null);
-  
-          setViolations(computeViolations(saved.playerBoard, saved.puzzle));
-        }
-      } finally {
-        if (!alive) return;
-        didHydrateRef.current = true;
-        setIsHydrating(false);
-      }
-    })();
-  
-    return () => {
-      alive = false;
-    };
-  }, []);
-  
-  useEffect(() => {
-    if (!didHydrateRef.current) return;
     if (!puzzle) return;
-  
+
     scheduleSave({
       v: 1,
       savedAt: Date.now(),
@@ -411,39 +601,133 @@ export default function App() {
       playerBoard,
       history,
       future,
-      useDense,
+      useDense: false, // no longer in UI; keep field for compatibility
     });
-  }, [puzzle, playerBoard, history, future, useDense]);
+  }, [puzzle, playerBoard, history, future]);
+
+  // Load + validate pool once
+  useEffect(() => {
+    try {
+      const validated = validatePoolOrThrow(RAW_POOL_JSON);
+      setPool(validated);
+      setPoolError(null);
+      console.log(`Pool loaded: ${validated.puzzles.length} puzzles`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setPool(null);
+      setPoolError(msg);
+      console.warn("Failed to load puzzle pool:", msg);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!pool) return;
+    (async () => {
+      const progress = await loadPoolProgress(pool);
+      setPoolProgressLoadedCount(progress.loaded.length);
+    })();
+  }, [pool]);
   
+
+  const startDisabled = isGenerating;
+  const poolDisabled = !poolHasRemaining || startDisabled;
 
   return (
     <SafeAreaView style={styles.safe}>
       <StatusBar barStyle="dark-content" />
+
       <View style={styles.container}>
         <Text style={styles.title}>Blueberry Puzzle</Text>
         <Text style={styles.subtitle}>3 berries per row, column & block</Text>
 
-        {!puzzle && !isGenerating && !isHydrating && (
-          <Text style={styles.hint}>
-            Press <Text style={styles.bold}>Generate puzzle</Text> to start.
-          </Text>
-        )}
-
         {isGenerating && (
           <View style={styles.generating}>
             <ActivityIndicator size="small" />
-            <Text style={styles.generatingText}>Generating puzzle…</Text>
+            <Text style={styles.generatingText}>Preparing game…</Text>
           </View>
         )}
 
-        {isHydrating && (
-          <View style={styles.generating}>
-            <ActivityIndicator size="small" />
-            <Text style={styles.generatingText}>Loading saved game…</Text>
-          </View>
+        {poolError && (
+          <Text style={[styles.status, styles.statusError]}>
+            Pool load failed; pool buttons disabled. ({poolError})
+          </Text>
         )}
 
-        {puzzle && (
+        {screen === "start" && (
+          <>
+            <View style={styles.startWrap}>
+              <Text style={styles.startHint}>Choose how to start a new game:</Text>
+              {pool && (
+                <Text style={styles.startNote}>
+                  Pool progress: {poolProgressLoadedCount} / {poolSize} used
+                </Text>
+              )}
+
+              <Pressable
+                style={[styles.buttonWide, poolDisabled && styles.buttonDisabled]}
+                onPress={loadNextPuzzleFromPool}
+                disabled={poolDisabled}
+              >
+                <Text style={styles.buttonText}>
+                  Next puzzle {pool ? `(${poolRemaining} left)` : "(pool unavailable)"}
+                </Text>
+              </Pressable>
+
+              {poolAvailable && (
+                <Pressable
+                  onPress={handleResetPoolProgress}
+                  disabled={startDisabled}
+                  style={[styles.linkWrap, startDisabled && styles.buttonDisabled]}
+                >
+                  <Text style={styles.linkText}>Reset pool progress</Text>
+                </Pressable>
+              )}
+
+              <Pressable
+                style={[styles.buttonWide, poolDisabled && styles.buttonDisabled]}
+                onPress={loadRandomPuzzleFromPool}
+                disabled={poolDisabled}
+              >
+                <Text style={styles.buttonText}>
+                  Random puzzle {pool ? `(${poolRemaining} left)` : "(pool unavailable)"}
+                </Text>
+              </Pressable>
+
+              <Pressable
+                style={[styles.buttonWide, startDisabled && styles.buttonDisabled]}
+                onPress={() => generatePuzzle(false)}
+                disabled={startDisabled}
+              >
+                <Text style={styles.buttonText}>Generate puzzle</Text>
+              </Pressable>
+
+              <Pressable
+                style={[styles.buttonWide, startDisabled && styles.buttonDisabled]}
+                onPress={() => generatePuzzle(true)}
+                disabled={startDisabled}
+              >
+                <Text style={styles.buttonText}>Generate puzzle (extra clues)</Text>
+              </Pressable>
+
+              <Text style={styles.startNote}>
+                Tip: pool puzzles start instantly. Generator may take a while on some devices.
+              </Text>
+            </View>
+
+            {status !== "" && (
+              <Text
+                style={[
+                  styles.status,
+                  statusOk === true ? styles.statusOk : statusOk === false ? styles.statusError : null,
+                ]}
+              >
+                {status}
+              </Text>
+            )}
+          </>
+        )}
+
+        {screen === "game" && puzzle && (
           <>
             <View style={styles.grid}>
               {Array.from({ length: N }, (_, r) => (
@@ -459,7 +743,7 @@ export default function App() {
                 <Pressable
                   style={[styles.button, readyToCheck && styles.buttonCheckReady]}
                   onPress={checkSolution}
-                  disabled={isGenerating || isHydrating}
+                  disabled={isGenerating}
                 >
                   <Text style={styles.buttonText}>Check</Text>
                 </Pressable>
@@ -469,20 +753,14 @@ export default function App() {
             {/* Row: Undo / Redo / Clear */}
             <View style={styles.buttonsRow}>
               <Pressable
-                style={[
-                  styles.button,
-                  (!canUndo || isGenerating) && styles.buttonDisabled,
-                ]}
+                style={[styles.button, (!canUndo || isGenerating) && styles.buttonDisabled]}
                 onPress={undo}
                 disabled={!canUndo || isGenerating}
               >
                 <Text style={styles.buttonText}>Undo</Text>
               </Pressable>
               <Pressable
-                style={[
-                  styles.button,
-                  (!canRedo || isGenerating) && styles.buttonDisabled,
-                ]}
+                style={[styles.button, (!canRedo || isGenerating) && styles.buttonDisabled]}
                 onPress={redo}
                 disabled={!canRedo || isGenerating}
               >
@@ -491,101 +769,50 @@ export default function App() {
               <Pressable
                 style={[styles.button, isGenerating && styles.buttonDisabled]}
                 onPress={clearBoard}
-                disabled={isGenerating || isHydrating}
+                disabled={isGenerating}
               >
                 <Text style={styles.buttonText}>Clear</Text>
               </Pressable>
             </View>
 
             {/* Show / Hide solution */}
+            {!isSolved && (
+              <Pressable
+                style={styles.toggle}
+                onPress={toggleShowSolution}
+                disabled={isGenerating}
+              >
+                <Text style={styles.toggleText}>
+                  {showSolution ? "Hide solution" : "Show solution"}
+                </Text>
+              </Pressable>
+            )}
+
+            {/* New game */}
             <Pressable
-              style={styles.toggle}
-              onPress={toggleShowSolution}
-              disabled={isGenerating || isHydrating}
+              style={[styles.buttonWide, isGenerating && styles.buttonDisabled]}
+              onPress={newGame}
+              disabled={isGenerating}
             >
-              <Text style={styles.toggleText}>
-                {showSolution ? "Hide solution" : "Show solution"}
-              </Text>
+              <Text style={styles.buttonText}>New game</Text>
             </Pressable>
+
+            {status !== "" && (
+              <Text
+                style={[
+                  styles.status,
+                  statusOk === true ? styles.statusOk : statusOk === false ? styles.statusError : null,
+                ]}
+              >
+                {status}
+              </Text>
+            )}
           </>
-        )}
-
-        {/* Optimized / dense clues toggle */}
-        <View style={styles.difficultyWrap}>
-          <Text style={styles.difficultyLabel}>Next puzzle difficulty</Text>
-
-          <View style={styles.difficultyRow}>
-            <Pressable
-              style={[
-                styles.difficultyPill,
-                !useDense && styles.difficultyPillActive,
-              ]}
-              onPress={() => setUseDense(false)}
-              disabled={isGenerating || isHydrating}
-            >
-              <Text
-                style={[
-                  styles.difficultyPillText,
-                  !useDense && styles.difficultyPillTextActive,
-                ]}
-              >
-                HIGH
-              </Text>
-            </Pressable>
-
-            <Pressable
-              style={[
-                styles.difficultyPill,
-                useDense && styles.difficultyPillActive,
-              ]}
-              onPress={() => setUseDense(true)}
-              disabled={isGenerating || isHydrating}
-            >
-              <Text
-                style={[
-                  styles.difficultyPillText,
-                  useDense && styles.difficultyPillTextActive,
-                ]}
-              >
-                More Clues
-              </Text>
-            </Pressable>
-          </View>
-        </View>
-
-
-        {/* Big generate button */}
-        <Pressable
-          style={[styles.buttonWide, isGenerating && styles.buttonDisabled]}
-          onPress={generateNewPuzzle}
-          disabled={isGenerating || isHydrating}
-        >
-          <Text style={styles.buttonText}>
-            {puzzle ? "Generate another puzzle" : "Generate puzzle"}
-          </Text>
-        </Pressable>
-
-        {status !== "" && (
-          <Text
-            style={[
-              styles.status,
-              statusOk === true
-                ? styles.statusOk
-                : statusOk === false
-                ? styles.statusError
-                : null,
-            ]}
-          >
-            {status}
-          </Text>
         )}
       </View>
     </SafeAreaView>
   );
 }
-
-const CELL_SIZE = 32;
-const TOTAL_BERRIES_REQUIRED = 27;
 
 const styles = StyleSheet.create({
   safe: {
@@ -595,7 +822,8 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     alignItems: "center",
-    paddingTop: 40, // moved down out of notch/camera area
+    paddingTop: 40,
+    paddingHorizontal: 12,
   },
   title: {
     fontSize: 24,
@@ -607,13 +835,23 @@ const styles = StyleSheet.create({
     color: "#555",
     marginBottom: 12,
   },
-  hint: {
-    fontSize: 14,
-    marginBottom: 10,
-    color: "#555",
+  startWrap: {
+    width: "100%",
+    maxWidth: 420,
+    alignItems: "center",
+    marginTop: 8,
   },
-  bold: {
-    fontWeight: "700",
+  startHint: {
+    fontSize: 14,
+    color: "#374151",
+    marginBottom: 10,
+  },
+  startNote: {
+    marginTop: 10,
+    fontSize: 12,
+    color: "#6b7280",
+    textAlign: "center",
+    maxWidth: 360,
   },
   grid: {
     borderColor: "#000",
@@ -651,7 +889,7 @@ const styles = StyleSheet.create({
     borderWidth: 2,
   },
   cellClueAreaViolation: {
-    backgroundColor: "#fef3c7", // light amber
+    backgroundColor: "#fef3c7",
   },
   buttonsRow: {
     flexDirection: "row",
@@ -668,10 +906,13 @@ const styles = StyleSheet.create({
   },
   buttonWide: {
     backgroundColor: "#2563eb",
+    width: "100%",
+    maxWidth: 420,
     paddingHorizontal: 20,
-    paddingVertical: 10,
-    borderRadius: 8,
-    marginTop: 4,
+    paddingVertical: 12,
+    borderRadius: 10,
+    marginTop: 8,
+    alignItems: "center",
   },
   buttonDisabled: {
     opacity: 0.4,
@@ -685,25 +926,17 @@ const styles = StyleSheet.create({
     borderColor: "#111827",
   },
   toggle: {
-    marginBottom: 4,
+    marginBottom: 6,
   },
   toggleText: {
     color: "#2563eb",
     textDecorationLine: "underline",
   },
-  toggleSmall: {
-    marginTop: 4,
-    marginBottom: 4,
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-  },
-  toggleTextSmall: {
-    fontSize: 12,
-    color: "#374151",
-  },
   status: {
-    marginTop: 6,
+    marginTop: 10,
     fontSize: 14,
+    textAlign: "center",
+    paddingHorizontal: 10,
   },
   statusOk: {
     color: "#16a34a",
@@ -714,48 +947,24 @@ const styles = StyleSheet.create({
   generating: {
     flexDirection: "row",
     alignItems: "center",
-    marginBottom: 12,
+    marginBottom: 6,
     gap: 8,
   },
   generatingText: {
     marginLeft: 8,
     fontSize: 14,
   },
-  difficultyWrap: {
-    marginTop: 6,
-    marginBottom: 6,
-    alignItems: "center",
-  },
-  difficultyLabel: {
-    fontSize: 12,
-    color: "#374151",
-    marginBottom: 6,
-  },
-  difficultyRow: {
-    flexDirection: "row",
-    gap: 8,
-  },
-  difficultyPill: {
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: "#9ca3af",
-    backgroundColor: "#fff",
-  },
-  difficultyPillActive: {
-    borderColor: "#111827",
-    borderWidth: 2,
-  },
-  difficultyPillText: {
-    fontSize: 12,
-    color: "#374151",
-    fontWeight: "600",
-  },
-  difficultyPillTextActive: {
-    color: "#111827",
-  },
   checkWrap: {
-    marginBottom: 10, // reserved spacing so pulse never overlaps Undo/Redo/Clear
+    marginBottom: 10,
+  },
+  linkWrap: {
+    marginTop: 10,
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+  },
+  linkText: {
+    color: "#2563eb",
+    textDecorationLine: "underline",
+    fontSize: 12,
   },
 });

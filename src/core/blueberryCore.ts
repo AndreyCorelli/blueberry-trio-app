@@ -454,3 +454,177 @@ export function makePuzzle(options?: { dense?: boolean }): Puzzle {
 
   return { solution: board, puzzleClues };
 }
+
+// ---------- Solver: produce one solution board for a given clue grid ----------
+
+export function solveOneFromClueGrid(puzzleClues: ClueGrid): Board | null {
+  // Build clues map: key "r,c" -> clue value.
+  // Any cell with a clue is guaranteed to be empty (forbidden berry).
+  const clues = new Map<string, number>();
+  const rowForbiddenCols: Map<number, Set<number>> = new Map();
+
+  for (let r = 0; r < N; r++) {
+    for (let c = 0; c < N; c++) {
+      const v = puzzleClues[r][c];
+      if (v === null) continue;
+      clues.set(`${r},${c}`, v);
+      if (!rowForbiddenCols.has(r)) rowForbiddenCols.set(r, new Set());
+      rowForbiddenCols.get(r)!.add(c);
+    }
+  }
+
+  // Convert clues to list for faster iteration in checks
+  type CellClue = { r: number; c: number; v: number };
+  const clueList: CellClue[] = [];
+  clues.forEach((v, key) => {
+    const [rs, cs] = key.split(",");
+    clueList.push({ r: parseInt(rs, 10), c: parseInt(cs, 10), v });
+  });
+
+  // Precompute allowed row patterns for each row (respecting forbidden cols)
+  const validRows: number[][][] = [];
+  for (let r = 0; r < N; r++) {
+    const forbidden = rowForbiddenCols.get(r) ?? new Set<number>();
+    const rowsForR: number[][] = [];
+    for (const pattern of ROW_PATTERNS) {
+      let ok = true;
+      for (const fc of forbidden) {
+        if (pattern[fc] === 1) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) rowsForR.push(pattern);
+    }
+    validRows.push(rowsForR);
+  }
+
+  const colCounts = new Array<number>(N).fill(0);
+  const blockCounts = new Array<number>(N).fill(0);
+  const boardRows: Board = Array.from({ length: N }, () => new Array<number>(N).fill(0));
+
+  function checkCluesPartial(lastRowIndex: number): boolean {
+    for (const clue of clueList) {
+      const { r: cr, c: cc, v: clueVal } = clue;
+
+      let current = 0;
+      let unknownMaxAdd = 0;
+
+      for (const [dr, dc] of NEIGHBOR_DIRS) {
+        const nr = cr + dr;
+        const nc = cc + dc;
+        if (nr >= 0 && nr < N && nc >= 0 && nc < N) {
+          if (nr <= lastRowIndex) {
+            current += boardRows[nr][nc];
+          } else {
+            unknownMaxAdd++;
+          }
+        }
+      }
+
+      if (current > clueVal) return false;
+      if (current + unknownMaxAdd < clueVal) return false;
+      if (unknownMaxAdd === 0 && current !== clueVal) return false;
+    }
+    return true;
+  }
+
+  function checkCluesFull(): boolean {
+    for (const clue of clueList) {
+      const { r: cr, c: cc, v: clueVal } = clue;
+      let cnt = 0;
+      for (const [dr, dc] of NEIGHBOR_DIRS) {
+        const nr = cr + dr;
+        const nc = cc + dc;
+        if (nr >= 0 && nr < N && nc >= 0 && nc < N) {
+          cnt += boardRows[nr][nc];
+        }
+      }
+      if (cnt !== clueVal) return false;
+    }
+    return true;
+  }
+
+  function cloneBoardRows(): Board {
+    return boardRows.map((row) => row.slice());
+  }
+
+  function backtrack(r: number): Board | null {
+    if (r === N) {
+      if (!colCounts.every((c) => c === 3)) return null;
+      if (!blockCounts.every((b) => b === 3)) return null;
+      if (!checkCluesFull()) return null;
+      return cloneBoardRows();
+    }
+
+    const remainingRows = N - (r + 1);
+
+    for (const row of validRows[r]) {
+      let ok = true;
+      const addCols = new Array<number>(N).fill(0);
+      const addBlocks = new Array<number>(N).fill(0);
+
+      for (let c = 0; c < N; c++) {
+        const val = row[c];
+        if (!val) continue;
+
+        const newCol = colCounts[c] + 1;
+        if (newCol > 3) {
+          ok = false;
+          break;
+        }
+
+        const blockId = Math.floor(r / 3) * 3 + Math.floor(c / 3);
+        const newBlock = blockCounts[blockId] + 1;
+        if (newBlock > 3) {
+          ok = false;
+          break;
+        }
+
+        addCols[c] += 1;
+        addBlocks[blockId] += 1;
+      }
+
+      if (!ok) continue;
+
+      // apply
+      for (let c = 0; c < N; c++) colCounts[c] += addCols[c];
+      for (let b = 0; b < N; b++) blockCounts[b] += addBlocks[b];
+      boardRows[r] = row;
+
+      // close 3-row band: each of its three blocks must be exactly 3
+      if (r % 3 === 2) {
+        const blockRow = Math.floor(r / 3);
+        const start = blockRow * 3;
+        const end = start + 3;
+        if (!blockCounts.slice(start, end).every((bc) => bc === 3)) {
+          for (let c = 0; c < N; c++) colCounts[c] -= addCols[c];
+          for (let b = 0; b < N; b++) blockCounts[b] -= addBlocks[b];
+          continue;
+        }
+      }
+
+      // column feasibility
+      let feasible = true;
+      for (let c = 0; c < N; c++) {
+        if (colCounts[c] > 3 || colCounts[c] + remainingRows < 3) {
+          feasible = false;
+          break;
+        }
+      }
+
+      if (feasible && checkCluesPartial(r)) {
+        const res = backtrack(r + 1);
+        if (res) return res;
+      }
+
+      // revert
+      for (let c = 0; c < N; c++) colCounts[c] -= addCols[c];
+      for (let b = 0; b < N; b++) blockCounts[b] -= addBlocks[b];
+    }
+
+    return null;
+  }
+
+  return backtrack(0);
+}

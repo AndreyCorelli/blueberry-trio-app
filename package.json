@@ -8,7 +8,9 @@
     "ios": "expo start --ios",
     "web": "expo start --web",
     "test": "vitest",
-    "test:run": "vitest run"
+    "test:run": "vitest run",
+    "pool:gen": "tsx scripts/generatePuzzlePool.ts",
+    "pool:sort": "tsx scripts/generatePuzzlePool.ts --sort"
   },
   "dependencies": {
     "@react-native-async-storage/async-storage": "2.2.0",
@@ -21,6 +23,7 @@
   },
   "devDependencies": {
     "@types/react": "~19.1.0",
+    "tsx": "^4.21.0",
     "typescript": "~5.9.2",
     "vitest": "^4.0.16"
   },
