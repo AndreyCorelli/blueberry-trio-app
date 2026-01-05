@@ -27,76 +27,15 @@ import {
   resetPoolProgress,
   loadSavedGame,
 } from "./src/core/gameSave";
+import {
+  computeViolations
+} from "./src/core/rulesCheck"
 
 import type { PuzzlePoolV1 } from "./src/core/gameSave";
-
-type PlayerCellState = -1 | 0 | 1; // -1 = marked empty, 0 = unknown, 1 = berry
-
-type Violations = {
-  row: boolean[];
-  col: boolean[];
-  block: boolean[];
-  clueArea: boolean[][];
-};
+import type { PlayerCellState, Violations } from "./src/core/rulesCheck";
 
 // Pool JSON is bundled into the app
 const RAW_POOL_JSON = require("./assets/pool/puzzlePool.v1.json");
-
-function computeViolations(board: PlayerCellState[][], puzzle: Puzzle): Violations {
-  const row = new Array<boolean>(N).fill(false);
-  const col = new Array<boolean>(N).fill(false);
-  const block = new Array<boolean>(N).fill(false);
-  const { clueArea } = computeClueAreaViolations(board, puzzle.puzzleClues);
-
-  // --- Row violations ---
-  for (let r = 0; r < N; r++) {
-    let berries = 0;
-    let unknown = 0;
-    for (let c = 0; c < N; c++) {
-      const v = board[r]?.[c] ?? 0;
-      if (v === 1) berries++;
-      else if (v === 0) unknown++;
-    }
-    if (berries > 3 || (unknown === 0 && berries !== 3)) {
-      row[r] = true;
-    }
-  }
-
-  // --- Column violations ---
-  for (let c = 0; c < N; c++) {
-    let berries = 0;
-    let unknown = 0;
-    for (let r = 0; r < N; r++) {
-      const v = board[r]?.[c] ?? 0;
-      if (v === 1) berries++;
-      else if (v === 0) unknown++;
-    }
-    if (berries > 3 || (unknown === 0 && berries !== 3)) {
-      col[c] = true;
-    }
-  }
-
-  // --- 3x3 block violations ---
-  for (let br = 0; br < 3; br++) {
-    for (let bc = 0; bc < 3; bc++) {
-      let berries = 0;
-      let unknown = 0;
-      for (let r = br * 3; r < br * 3 + 3; r++) {
-        for (let c = bc * 3; c < bc * 3 + 3; c++) {
-          const v = board[r]?.[c] ?? 0;
-          if (v === 1) berries++;
-          else if (v === 0) unknown++;
-        }
-      }
-      const blockIndex = br * 3 + bc;
-      if (berries > 3 || (unknown === 0 && berries !== 3)) {
-        block[blockIndex] = true;
-      }
-    }
-  }
-
-  return { row, col, block, clueArea };
-}
 
 function isInt(x: unknown): x is number {
   return typeof x === "number" && Number.isInteger(x);

@@ -116,8 +116,8 @@ function validateSavedGameV1(x: unknown, N: number): x is SavedGameV1 {
   if (!o.playerBoard.every((row: unknown[]) => row.every(isPlayerCell))) return false;
 
   // history/future can be empty; limit depth to avoid accidental huge payloads
-  if (!is3D<PlayerCellState>(o.history, 500, N, N)) return false;
-  if (!is3D<PlayerCellState>(o.future, 500, N, N)) return false;
+  if (!is3D<PlayerCellState>(o.history, 1500, N, N)) return false;
+  if (!is3D<PlayerCellState>(o.future, 1500, N, N)) return false;
 
   // validate history/future cell values too
   for (const board of o.history) {
